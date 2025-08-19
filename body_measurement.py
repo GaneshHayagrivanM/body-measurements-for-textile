@@ -32,13 +32,13 @@ class BodyMeasurementSystem:
         # For drawing the pose landmarks
         self.mp_drawing = mp.solutions.drawing_utils
         
-        # For storing 3D points from all frames
-        self.body_points_3d = []
-        self.frame_angles = []
-        self.landmark_tracks = {i: [] for i in range(33)}  # MediaPipe has 33 landmarks
+        # For storing partial point clouds from each frame
+        self.partial_pcds = []
         
         # Scale factor (to be calculated during processing)
         self.scale_factor = 1.0
+        # Final reconstructed model
+        self.model = None
         
     def process_video(self, video_path: str) -> None:
         """Process the 360-degree video to extract body points."""
@@ -47,8 +47,10 @@ class BodyMeasurementSystem:
             
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
         
+        if total_frames == 0:
+            raise ValueError("Video file could not be opened or is empty.")
+
         # Assuming a full 360° rotation, calculate angle per frame
         angle_per_frame = 360 / total_frames
         
@@ -58,9 +60,8 @@ class BodyMeasurementSystem:
             if not success:
                 break
                 
-            # Calculate the current angle based on frame index
-            current_angle = frame_idx * angle_per_frame
-            self.frame_angles.append(math.radians(current_angle))
+            # Calculate the current angle based on frame index (in radians)
+            current_angle = math.radians(frame_idx * angle_per_frame)
             
             # Process the frame
             self._process_frame(frame, current_angle)
@@ -73,271 +74,244 @@ class BodyMeasurementSystem:
                 
         cap.release()
         
-        # Reconstruct 3D model and calculate measurements
+        if not self.partial_pcds:
+            print("Warning: No human pose detected in any frame. Cannot generate a model.")
+            return
+
+        # Reconstruct 3D model from the collected point clouds
         self._reconstruct_3d_model()
         
     def _process_frame(self, frame: np.ndarray, angle: float) -> None:
-        """Process a single frame to extract body landmarks."""
+        """
+        Process a single frame to extract a partial 3D point cloud.
+        Uses MediaPipe's pose_world_landmarks for 3D coordinates.
+        """
         # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # Process the frame with MediaPipe
         results = self.pose.process(rgb_frame)
         
-        if results.pose_landmarks:
-            # Extract landmarks
-            landmarks = results.pose_landmarks.landmark
+        if results.pose_world_landmarks:
+            # Get landmarks in their own 3D coordinate system
+            landmarks = results.pose_world_landmarks.landmark
+            points_3d = []
             
-            h, w, _ = frame.shape
+            for landmark in landmarks:
+                # MediaPipe's world landmarks are in meters, with y-axis down.
+                # We'll flip the y-axis to have y-up.
+                points_3d.append([landmark.x, -landmark.y, landmark.z])
             
-            # Store landmarks in 3D space based on camera position
-            for idx, landmark in enumerate(landmarks):
-                # Convert to pixel coordinates
-                x, y, z = landmark.x * w, landmark.y * h, landmark.z * w
-                
-                # Store in the landmark tracks
-                self.landmark_tracks[idx].append((x, y, z, angle))
+            points_3d = np.array(points_3d)
+            
+            # Create the rotation matrix to transform points to the world frame
+            # The angle is the camera's position on the XZ plane, so we rotate around Y
+            rotation_matrix = np.array([
+                [math.cos(angle), 0, math.sin(angle)],
+                [0, 1, 0],
+                [-math.sin(angle), 0, math.cos(angle)]
+            ])
+            
+            # Apply the rotation
+            transformed_points = points_3d @ rotation_matrix.T
+            
+            # Create an Open3D point cloud
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(transformed_points)
+            
+            # Add the partial point cloud to our list
+            self.partial_pcds.append(pcd)
                 
     def _reconstruct_3d_model(self) -> None:
-        """Reconstruct 3D model from the tracked landmarks."""
-        # Convert landmark tracks to 3D points in a cylindrical coordinate system
-        self.model_3d = {}
+        """
+        Reconstruct a full 3D model by aligning and merging partial point clouds.
+        """
+        print("Reconstructing 3D model...")
         
-        for landmark_idx, track in self.landmark_tracks.items():
-            if not track:
-                continue
-                
-            # Average the positions from different views for better accuracy
-            positions = np.array([(pos[0], pos[1], pos[2], pos[3]) for pos in track])
+        # The first point cloud is the base
+        global_pcd = self.partial_pcds[0]
+        
+        # ICP parameters
+        threshold = 0.02  # 2cm distance threshold for correspondence
+        trans_init = np.identity(4) # Initial transformation guess
+
+        # Keep track of landmark positions through the transformations
+        landmark_positions = {i: [] for i in range(33)}
+        for i, p in enumerate(np.asarray(global_pcd.points)):
+            landmark_positions[i].append(p)
+
+        # Iteratively align each subsequent point cloud to the global one
+        for i in range(1, len(self.partial_pcds)):
+            source_pcd = self.partial_pcds[i]
             
-            # Convert to 3D coordinates
-            x_coords = []
-            y_coords = []
-            z_coords = []
+            # Run ICP
+            reg_p2p = o3d.pipelines.registration.registration_icp(
+                source_pcd, global_pcd, threshold, trans_init,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=2000)
+            )
             
-            for pos in positions:
-                x, y, z, angle = pos
-                
-                # Use camera radius and angle to determine 3D position
-                # The exact transformation depends on camera setup and coordinate system
-                x_3d = self.camera_radius * math.cos(angle) + x * math.cos(angle)
-                y_3d = y  # Height (Y) remains the same
-                z_3d = self.camera_radius * math.sin(angle) + x * math.sin(angle)
-                
-                x_coords.append(x_3d)
-                y_coords.append(y_3d)
-                z_coords.append(z_3d)
+            # Transform the source point cloud with the calculated alignment
+            source_pcd.transform(reg_p2p.transformation)
             
-            # Average the 3D positions to get a single point
-            avg_x = np.mean(x_coords)
-            avg_y = np.mean(y_coords)
-            avg_z = np.mean(z_coords)
+            # Record the transformed landmark positions
+            for lm_idx, p in enumerate(np.asarray(source_pcd.points)):
+                landmark_positions[lm_idx].append(p)
+
+            # Merge with the global point cloud
+            global_pcd += source_pcd
+        
+        # Calculate the final average position for each landmark
+        self.final_landmarks = {
+            i: np.mean(positions, axis=0)
+            for i, positions in landmark_positions.items() if positions
+        }
+
+        # Downsample the point cloud to make it uniform
+        # Voxel size of 5mm
+        uniform_pcd = global_pcd.voxel_down_sample(voxel_size=0.005)
+
+        # Remove statistical outliers to clean up noise
+        pcd_cleaned, ind = uniform_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        self.model = pcd_cleaned.select_by_index(ind)
+
+        print("Point cloud processed. Starting surface reconstruction...")
+
+        # Estimate normals for the point cloud
+        self.model.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
             
-            self.model_3d[landmark_idx] = (avg_x, avg_y, avg_z)
+        # Perform surface reconstruction using Ball Pivoting Algorithm
+        radii = [0.005, 0.01, 0.02, 0.04]
+        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+            self.model, o3d.utility.DoubleVector(radii))
             
+        # The result is a mesh, which we store as our model
+        self.model = mesh
+        
+        print("3D model reconstruction complete.")
+        
         # Calculate scale factor if calibration height is provided
         if self.calibration_height:
-            # MediaPipe landmarks: 0=nose, 29=left heel, 30=right heel
-            if 0 in self.model_3d and 29 in self.model_3d and 30 in self.model_3d:
-                nose = self.model_3d[0]
-                left_heel = self.model_3d[29]
-                right_heel = self.model_3d[30]
-                
-                # Average the heel positions for the bottom point
-                bottom_y = (left_heel[1] + right_heel[1]) / 2
-                height_pixels = nose[1] - bottom_y
-                
-                # Calculate scale factor (cm per pixel)
-                self.scale_factor = abs(self.calibration_height / height_pixels)
+            # The model points are in meters. Find the height of the model.
+            points = np.asarray(self.model.points)
+            min_y = np.min(points[:, 1])
+            max_y = np.max(points[:, 1])
             
+            model_height = max_y - min_y
+            
+            if model_height > 0:
+                # The scale factor converts from model units (meters) to cm
+                self.scale_factor = (self.calibration_height / model_height)
+            else:
+                print("Warning: Model height is zero, cannot calculate scale factor.")
+                self.scale_factor = 100.0 # Fallback to convert meters to cm
+        else:
+            # If no calibration height, assume model is at real scale and convert meters to cm
+            self.scale_factor = 100.0
+
     def calculate_measurements(self) -> Dict[str, float]:
-        """Calculate body measurements from the 3D model."""
-        if not hasattr(self, 'model_3d') or not self.model_3d:
+        """Calculate body measurements from the reconstructed 3D model."""
+        if self.model is None or not hasattr(self, 'final_landmarks'):
             raise ValueError("3D model has not been reconstructed yet. Run process_video first.")
             
         measurements = {}
         
-        # Calculate height
-        # MediaPipe landmarks: 0=nose, 29=left heel, 30=right heel
-        if 0 in self.model_3d and 29 in self.model_3d and 30 in self.model_3d:
-            nose = self.model_3d[0]
-            left_heel = self.model_3d[29]
-            right_heel = self.model_3d[30]
+        # Height: from the mesh's bounding box
+        bounding_box = self.model.get_axis_aligned_bounding_box()
+        model_height = bounding_box.get_extent()[1]
+        measurements['height'] = model_height * self.scale_factor
+
+        # Shoulder width
+        if 11 in self.final_landmarks and 12 in self.final_landmarks:
+            p1 = self.final_landmarks[11]
+            p2 = self.final_landmarks[12]
+            dist = np.linalg.norm(p1 - p2)
+            measurements['shoulders'] = dist * self.scale_factor
+
+        # Arm length (left arm)
+        if 11 in self.final_landmarks and 13 in self.final_landmarks and 15 in self.final_landmarks:
+            shoulder, elbow, wrist = self.final_landmarks[11], self.final_landmarks[13], self.final_landmarks[15]
+            upper_arm = np.linalg.norm(shoulder - elbow)
+            forearm = np.linalg.norm(elbow - wrist)
+            measurements['arm_length'] = (upper_arm + forearm) * self.scale_factor
             
-            # Use the lowest point of the heels
-            bottom_y = max(left_heel[1], right_heel[1])  # Y increases downward in image coordinates
-            height_model_units = abs(nose[1] - bottom_y)
-            measurements['height'] = height_model_units * self.scale_factor  # in cm
-        
-        # Calculate shoulder width
-        # MediaPipe landmarks: 11=left shoulder, 12=right shoulder
-        if 11 in self.model_3d and 12 in self.model_3d:
-            left_shoulder = self.model_3d[11]
-            right_shoulder = self.model_3d[12]
+        # Inseam (left leg)
+        if 23 in self.final_landmarks and 25 in self.final_landmarks and 27 in self.final_landmarks:
+            hip, knee, ankle = self.final_landmarks[23], self.final_landmarks[25], self.final_landmarks[27]
+            thigh = np.linalg.norm(hip - knee)
+            calf = np.linalg.norm(knee - ankle)
+            measurements['inseam'] = (thigh + calf) * self.scale_factor
             
-            shoulder_width = math.sqrt(
-                (left_shoulder[0] - right_shoulder[0])**2 + 
-                (left_shoulder[2] - right_shoulder[2])**2
-            )
-            measurements['shoulders'] = shoulder_width * self.scale_factor  # in cm
-        
-        # Calculate waist
-        # MediaPipe landmarks: 23=left hip, 24=right hip
-        if 23 in self.model_3d and 24 in self.model_3d:
-            left_hip = self.model_3d[23]
-            right_hip = self.model_3d[24]
+        # Circumference measurements
+        if 11 in self.final_landmarks and 12 in self.final_landmarks and \
+           23 in self.final_landmarks and 24 in self.final_landmarks:
             
-            # Estimate waist position (slightly above hips)
-            waist_y = (left_hip[1] + right_hip[1]) / 2 - 10  # Adjust as needed
+            # Estimate key body heights based on landmark positions
+            shoulder_y = (self.final_landmarks[11][1] + self.final_landmarks[12][1]) / 2
+            hip_y = (self.final_landmarks[23][1] + self.final_landmarks[24][1]) / 2
             
-            # Find points around this height for waist circumference
-            waist_points = []
-            for angle in np.linspace(0, 2*np.pi, 36):  # Sample 36 points around
-                # Estimate radius at each angle using body points
-                x = np.mean([p[0] for p in self.model_3d.values() if abs(p[1] - waist_y) < 15])
-                z = np.mean([p[2] for p in self.model_3d.values() if abs(p[1] - waist_y) < 15])
-                
-                # Adjust for body shape
-                radius = math.sqrt(x**2 + z**2)
-                
-                waist_points.append((radius * math.cos(angle), waist_y, radius * math.sin(angle)))
+            # Chest is slightly below shoulders
+            chest_y = shoulder_y - (shoulder_y - hip_y) * 0.2
+            measurements['chest'] = self._calculate_circumference_at_y(chest_y) * self.scale_factor
             
-            # Calculate waist circumference
-            waist_circumference = self._calculate_circumference(waist_points)
-            measurements['waist'] = waist_circumference * self.scale_factor  # in cm
-        
-        # Calculate hips
-        # MediaPipe landmarks: 23=left hip, 24=right hip
-        if 23 in self.model_3d and 24 in self.model_3d:
-            left_hip = self.model_3d[23]
-            right_hip = self.model_3d[24]
+            # Waist is roughly halfway between shoulders and hips
+            waist_y = shoulder_y - (shoulder_y - hip_y) * 0.5
+            measurements['waist'] = self._calculate_circumference_at_y(waist_y) * self.scale_factor
             
-            # Hip position (below waist)
-            hip_y = (left_hip[1] + right_hip[1]) / 2 + 15  # Adjust as needed
-            
-            # Find points around this height for hip circumference
-            hip_points = []
-            for angle in np.linspace(0, 2*np.pi, 36):  # Sample 36 points around
-                # Estimate radius at each angle
-                x = np.mean([p[0] for p in self.model_3d.values() if abs(p[1] - hip_y) < 15])
-                z = np.mean([p[2] for p in self.model_3d.values() if abs(p[1] - hip_y) < 15])
-                
-                # Adjust for body shape
-                radius = math.sqrt(x**2 + z**2)
-                
-                hip_points.append((radius * math.cos(angle), hip_y, radius * math.sin(angle)))
-            
-            # Calculate hip circumference
-            hip_circumference = self._calculate_circumference(hip_points)
-            measurements['hips'] = hip_circumference * self.scale_factor  # in cm
-        
-        # Additional measurements for clothing
-        
-        # Chest/bust
-        # Estimate chest position (above waist, below shoulders)
-        if 11 in self.model_3d and 12 in self.model_3d:
-            left_shoulder = self.model_3d[11]
-            right_shoulder = self.model_3d[12]
-            
-            chest_y = (left_shoulder[1] + right_shoulder[1]) / 2 + 25  # Adjust as needed
-            
-            chest_points = []
-            for angle in np.linspace(0, 2*np.pi, 36):
-                x = np.mean([p[0] for p in self.model_3d.values() if abs(p[1] - chest_y) < 15])
-                z = np.mean([p[2] for p in self.model_3d.values() if abs(p[1] - chest_y) < 15])
-                
-                radius = math.sqrt(x**2 + z**2)
-                chest_points.append((radius * math.cos(angle), chest_y, radius * math.sin(angle)))
-            
-            chest_circumference = self._calculate_circumference(chest_points)
-            measurements['chest'] = chest_circumference * self.scale_factor  # in cm
-        
-        # Arm length
-        # MediaPipe landmarks: 11=left shoulder, 13=left elbow, 15=left wrist
-        if 11 in self.model_3d and 13 in self.model_3d and 15 in self.model_3d:
-            left_shoulder = self.model_3d[11]
-            left_elbow = self.model_3d[13]
-            left_wrist = self.model_3d[15]
-            
-            upper_arm = math.sqrt(
-                (left_shoulder[0] - left_elbow[0])**2 + 
-                (left_shoulder[1] - left_elbow[1])**2 + 
-                (left_shoulder[2] - left_elbow[2])**2
-            )
-            
-            forearm = math.sqrt(
-                (left_elbow[0] - left_wrist[0])**2 + 
-                (left_elbow[1] - left_wrist[1])**2 + 
-                (left_elbow[2] - left_wrist[2])**2
-            )
-            
-            measurements['arm_length'] = (upper_arm + forearm) * self.scale_factor  # in cm
-        
-        # Inseam (inner leg length)
-        # MediaPipe landmarks: 23=left hip, 25=left knee, 27=left ankle
-        if 23 in self.model_3d and 25 in self.model_3d and 27 in self.model_3d:
-            left_hip = self.model_3d[23]
-            left_knee = self.model_3d[25]
-            left_ankle = self.model_3d[27]
-            
-            thigh = math.sqrt(
-                (left_hip[0] - left_knee[0])**2 + 
-                (left_hip[1] - left_knee[1])**2 + 
-                (left_hip[2] - left_knee[2])**2
-            )
-            
-            calf = math.sqrt(
-                (left_knee[0] - left_ankle[0])**2 + 
-                (left_knee[1] - left_ankle[1])**2 + 
-                (left_knee[2] - left_ankle[2])**2
-            )
-            
-            measurements['inseam'] = (thigh + calf) * self.scale_factor  # in cm
-        
+            # Hips
+            measurements['hips'] = self._calculate_circumference_at_y(hip_y) * self.scale_factor
+
         return measurements
         
-    def _calculate_circumference(self, points: List[Tuple[float, float, float]]) -> float:
-        """Calculate the circumference of a set of 3D points."""
-        if len(points) < 3:
+    def _calculate_circumference_at_y(self, y_level: float, slice_thickness: float = 0.02) -> float:
+        """
+        Calculates the circumference of the model at a specific y-level.
+        It does this by taking a thin slice of the model's vertices,
+        projecting them to the XZ plane, and finding the perimeter of their convex hull.
+        """
+        if self.model is None or not isinstance(self.model, o3d.geometry.TriangleMesh):
             return 0
             
-        # Project points onto the XZ plane for waist/hip calculation
-        points_2d = [(p[0], p[2]) for p in points]
+        vertices = np.asarray(self.model.vertices)
         
-        # Calculate convex hull
-        hull = ConvexHull(points_2d)
+        # Select points within the horizontal slice
+        slice_indices = np.where(np.abs(vertices[:, 1] - y_level) < (slice_thickness / 2))[0]
         
-        # Calculate perimeter of the hull
-        perimeter = 0
-        for simplex in hull.simplices:
-            p1 = points_2d[simplex[0]]
-            p2 = points_2d[simplex[1]]
-            perimeter += math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+        if len(slice_indices) < 3:
+            return 0 # Not enough points to form a polygon
             
-        return perimeter
+        slice_points = vertices[slice_indices]
+        
+        # Project points onto the XZ plane
+        points_2d = slice_points[:, [0, 2]]
+        
+        try:
+            # Calculate convex hull
+            hull = ConvexHull(points_2d)
+            # Calculate perimeter of the hull. For 2D hulls in scipy,
+            # .perimeter is the correct attribute for the perimeter length.
+            return hull.perimeter
+        except Exception:
+            # ConvexHull can fail if points are collinear
+            return 0
         
     def visualize_3d_model(self, save_path: str = None) -> None:
-        """Visualize the 3D model with measurements."""
-        if not hasattr(self, 'model_3d') or not self.model_3d:
-            raise ValueError("3D model has not been reconstructed yet. Run process_video first.")
-            
-        # Create a point cloud from the model
-        points = np.array(list(self.model_3d.values()))
+        """Visualize the reconstructed 3D mesh."""
+        if self.model is None or not isinstance(self.model, o3d.geometry.TriangleMesh):
+            print("Model has not been reconstructed as a mesh, cannot visualize.")
+            return
+
+        # Give the mesh a nice color
+        self.model.paint_uniform_color([0.7, 0.7, 0.7])
+        # Compute normals for better rendering
+        self.model.compute_vertex_normals()
         
-        # Create Open3D point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-        
-        # Add colors based on body parts
-        colors = np.zeros((len(points), 3))
-        colors[:, 0] = 0.8  # Default red tint
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-        
-        # Visualize
-        o3d.visualization.draw_geometries([pcd], 
-                                          window_name="3D Body Model",
+        # Visualize the mesh
+        o3d.visualization.draw_geometries([self.model],
+                                          window_name="Reconstructed 3D Body Model",
                                           width=800, height=600)
         
         if save_path:
-            o3d.io.write_point_cloud(save_path, pcd)
-            print(f"3D model saved to {save_path}")
+            o3d.io.write_triangle_mesh(save_path, self.model)
+            print(f"3D mesh model saved to {save_path}")

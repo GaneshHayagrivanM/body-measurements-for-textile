@@ -194,7 +194,7 @@ class BodyMeasurementSystem:
         # Calculate scale factor if calibration height is provided
         if self.calibration_height:
             # The model points are in meters. Find the height of the model.
-            points = np.asarray(self.model.points)
+            points = np.asarray(self.model.vertices)
             min_y = np.min(points[:, 1])
             max_y = np.max(points[:, 1])
             

@@ -4,21 +4,30 @@ import mediapipe as mp
 import open3d as o3d
 from scipy.spatial import ConvexHull
 import matplotlib.pyplot as plt
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import math
 import os
+from video_preprocessor import VideoPreprocessor, PreprocessingConfig
 
 class BodyMeasurementSystem:
-    def __init__(self, camera_radius: float, calibration_height: float = None):
+    def __init__(self, camera_radius: float, calibration_height: float = None, 
+                 preprocessing_config: PreprocessingConfig = None):
         """
         Initialize the body measurement system.
         
         Args:
             camera_radius: The constant radius of camera rotation (in cm)
             calibration_height: Optional known height of the person (in cm) for scaling
+            preprocessing_config: Optional preprocessing configuration
         """
         self.camera_radius = camera_radius
         self.calibration_height = calibration_height
+        
+        # Initialize preprocessing
+        self.preprocessing_config = preprocessing_config
+        self.preprocessor = None
+        if preprocessing_config:
+            self.preprocessor = VideoPreprocessor(preprocessing_config)
         
         # Initialize MediaPipe pose detection
         self.mp_pose = mp.solutions.pose
@@ -40,6 +49,9 @@ class BodyMeasurementSystem:
         # Final reconstructed model
         self.model = None
         
+        # Store preprocessing metrics
+        self.preprocessing_metrics = []
+        
     def process_video(self, video_path: str) -> None:
         """Process the 360-degree video to extract body points."""
         if not os.path.exists(video_path):
@@ -54,7 +66,30 @@ class BodyMeasurementSystem:
         # Assuming a full 360° rotation, calculate angle per frame
         angle_per_frame = 360 / total_frames
         
+        # Print preprocessing status
+        if self.preprocessor:
+            print(f"Video preprocessing enabled with the following features:")
+            config = self.preprocessing_config
+            enabled_features = []
+            if config.enable_brightness_contrast: enabled_features.append("brightness/contrast adjustment")
+            if config.enable_noise_reduction: enabled_features.append("noise reduction")
+            if config.enable_sharpening: enabled_features.append("sharpening")
+            if config.enable_histogram_equalization: enabled_features.append("histogram equalization")
+            if config.enable_background_subtraction: enabled_features.append("background subtraction")
+            if config.enable_edge_enhancement: enabled_features.append("edge enhancement")
+            if config.enable_color_space_conversion: enabled_features.append("color space optimization")
+            if config.enable_skin_tone_enhancement: enabled_features.append("skin tone enhancement")
+            if config.enable_frame_alignment: enabled_features.append("frame alignment")
+            if config.enable_quality_assessment: enabled_features.append("quality assessment")
+            
+            for feature in enabled_features:
+                print(f"  - {feature}")
+        else:
+            print("Video preprocessing disabled - using raw frames")
+        
         frame_idx = 0
+        preprocessing_times = []
+        
         while cap.isOpened():
             success, frame = cap.read()
             if not success:
@@ -63,23 +98,43 @@ class BodyMeasurementSystem:
             # Calculate the current angle based on frame index (in radians)
             current_angle = math.radians(frame_idx * angle_per_frame)
             
+            # Apply preprocessing if enabled
+            processed_frame = frame
+            if self.preprocessor:
+                processed_frame, metrics = self.preprocessor.process_frame(frame)
+                self.preprocessing_metrics.append(metrics)
+                if 'processing_time' in metrics:
+                    preprocessing_times.append(metrics['processing_time'])
+            
             # Process the frame
-            self._process_frame(frame, current_angle)
+            self._process_frame(processed_frame, current_angle)
             
             frame_idx += 1
             
             # Display progress
             if frame_idx % 10 == 0:
-                print(f"Processing frame {frame_idx}/{total_frames}")
+                progress_msg = f"Processing frame {frame_idx}/{total_frames}"
+                if self.preprocessor and preprocessing_times:
+                    avg_preprocess_time = np.mean(preprocessing_times[-10:])  # Last 10 frames
+                    progress_msg += f" (avg preprocessing: {avg_preprocess_time:.3f}s)"
+                print(progress_msg)
                 
         cap.release()
         
+        # Clean up preprocessing resources
+        if self.preprocessor:
+            self.preprocessor.cleanup()
+            
         if not self.partial_pcds:
             print("Warning: No human pose detected in any frame. Cannot generate a model.")
             return
 
         # Reconstruct 3D model from the collected point clouds
         self._reconstruct_3d_model()
+        
+        # Print preprocessing summary if enabled
+        if self.preprocessor:
+            self.print_preprocessing_summary()
         
     def _process_frame(self, frame: np.ndarray, angle: float) -> None:
         """
@@ -315,3 +370,77 @@ class BodyMeasurementSystem:
         if save_path:
             o3d.io.write_triangle_mesh(save_path, self.model)
             print(f"3D mesh model saved to {save_path}")
+    
+    def get_preprocessing_statistics(self) -> Dict[str, any]:
+        """Get comprehensive preprocessing statistics."""
+        if not self.preprocessor or not self.preprocessing_metrics:
+            return {"preprocessing_enabled": False}
+        
+        stats = {"preprocessing_enabled": True}
+        
+        # Get quality statistics from preprocessor
+        quality_stats = self.preprocessor.get_quality_statistics()
+        stats.update(quality_stats)
+        
+        # Calculate average metrics across all frames
+        if self.preprocessing_metrics:
+            # Collect all numeric metrics
+            metric_keys = set()
+            for metrics in self.preprocessing_metrics:
+                metric_keys.update(k for k, v in metrics.items() if isinstance(v, (int, float)))
+            
+            for key in metric_keys:
+                values = [m[key] for m in self.preprocessing_metrics if key in m and isinstance(m[key], (int, float))]
+                if values:
+                    stats[f"avg_{key}"] = np.mean(values)
+                    stats[f"std_{key}"] = np.std(values)
+                    stats[f"min_{key}"] = np.min(values)
+                    stats[f"max_{key}"] = np.max(values)
+        
+        return stats
+    
+    def print_preprocessing_summary(self):
+        """Print a summary of preprocessing performance and quality metrics."""
+        stats = self.get_preprocessing_statistics()
+        
+        if not stats.get("preprocessing_enabled", False):
+            print("Preprocessing was not enabled for this video.")
+            return
+        
+        print("\n" + "="*50)
+        print("VIDEO PREPROCESSING SUMMARY")
+        print("="*50)
+        
+        # Quality metrics
+        if 'mean_quality' in stats:
+            print(f"Overall Quality Score: {stats['mean_quality']:.3f} ± {stats.get('std_quality', 0):.3f}")
+            print(f"Quality Range: {stats.get('min_quality', 0):.3f} - {stats.get('max_quality', 0):.3f}")
+        
+        # Performance metrics
+        if 'avg_processing_time' in stats:
+            print(f"Average Processing Time per Frame: {stats['avg_processing_time']:.3f}s")
+            print(f"Processing Time Range: {stats.get('min_processing_time', 0):.3f}s - {stats.get('max_processing_time', 0):.3f}s")
+        
+        # Image quality metrics
+        if 'avg_sharpness' in stats:
+            print(f"Average Sharpness: {stats['avg_sharpness']:.1f}")
+        if 'avg_brightness' in stats:
+            print(f"Average Brightness: {stats['avg_brightness']:.1f}")
+        if 'avg_contrast' in stats:
+            print(f"Average Contrast: {stats['avg_contrast']:.1f}")
+        
+        # Motion and lighting analysis
+        if 'avg_motion_blur' in stats:
+            print(f"Motion Blur Score: {stats['avg_motion_blur']:.3f}")
+        if 'avg_overexposure' in stats:
+            print(f"Overexposure: {stats['avg_overexposure']:.3f}")
+        if 'avg_underexposure' in stats:
+            print(f"Underexposure: {stats['avg_underexposure']:.3f}")
+        
+        print(f"Total Frames Processed: {stats.get('frames_processed', 0)}")
+        print("="*50)
+    
+    def cleanup_preprocessing(self):
+        """Clean up preprocessing resources."""
+        if self.preprocessor:
+            self.preprocessor.cleanup()
